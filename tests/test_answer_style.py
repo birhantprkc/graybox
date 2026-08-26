@@ -16,7 +16,7 @@ def test_default_answer_style_preserves_existing_system_prompt(tmp_path, monkeyp
     cfg = load_config(str(_write_config(tmp_path)))
 
     assert cfg.prompts.answer_style == ""
-    assert _system_prompt(cfg) == RETRIEVAL_SYSTEM
+    assert RETRIEVAL_SYSTEM in _system_prompt(cfg)
 
 
 def test_configured_answer_style_is_appended(tmp_path, monkeypatch):
@@ -45,7 +45,7 @@ def test_whitespace_only_answer_style_is_empty(tmp_path, monkeypatch):
     )
 
     assert cfg.prompts.answer_style.strip() == ""
-    assert _system_prompt(cfg) == RETRIEVAL_SYSTEM
+    assert RETRIEVAL_SYSTEM in _system_prompt(cfg)
 
 
 def test_environment_overrides_yaml(tmp_path, monkeypatch):

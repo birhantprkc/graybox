@@ -82,13 +82,13 @@ class TestLlmCall:
 
     def test_messages_built_with_system_and_user(self, cfg):
         svc = AIService(cfg)
-        messages = svc._build_messages("system text", "user text")
+        messages = svc._build_messages("system text", "user text", None, None)
         assert messages[0] == {"role": "system", "content": "system text"}
         assert messages[1] == {"role": "user", "content": "user text"}
 
     def test_default_system_prompt_when_none(self, cfg):
         svc = AIService(cfg)
-        messages = svc._build_messages(None, "user text")
+        messages = svc._build_messages(None, "user text", None, None)
         assert messages[0]["content"] == "You are a helpful assistant."
 
     def test_streaming_call_returns_stream_wrapper(self, cfg):
