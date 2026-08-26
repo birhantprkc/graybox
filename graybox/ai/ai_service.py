@@ -130,22 +130,20 @@ class AIService:
             if not supports_pdf_input(self.config.llm.model_name, None):
                 raise ValueError("Model does not support PDF input")
 
-            return (
-                [
-                    {
-                        "role": "system",
-                        "content": system_prompt or "You are a helpful assistant.",
+            return [
+                {
+                    "role": "system",
+                    "content": system_prompt or "You are a helpful assistant.",
+                },
+                {"type": "text", "text": prompt},
+                {
+                    "type": "file",
+                    "file": {
+                        "file_id": file_input,
+                        "format": "application/pdf",
                     },
-                    {"type": "text", "text": prompt},
-                    {
-                        "type": "file",
-                        "file": {
-                            "file_id": file_input,
-                            "format": "application/pdf",
-                        },
-                    },
-                ],
-            )
+                },
+            ]
 
         if image:
             if not image.startswith(("http://", "https://")):
@@ -155,8 +153,7 @@ class AIService:
                         image = f"data:image/png;base64,{image.decode('utf-8')}"
                 except Exception:
                     raise ValueError(f"Invalid Image path.")
-            else:
-                raise ValueError("Image must be either a URL or Valid File Path.")
+
             return [
                 {
                     "role": "system",
