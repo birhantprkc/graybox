@@ -5,7 +5,7 @@ import pytest
  
 from graybox.curate import merge_pages, edit_page, delete_page, find_possible_duplicates
 from graybox.models import Page, now_iso
-from graybox.storage import read_page, write_page, list_pages
+from graybox.storage import read_page, write_page
  
  
 class TestMergePages:

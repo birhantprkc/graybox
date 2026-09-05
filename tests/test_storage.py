@@ -7,7 +7,6 @@ from graybox.storage import (
     read_page,
     list_pages,
     rewire_references,
-    page_path,
     _split_notes,
     _replace_wiki_link,
 )

@@ -42,6 +42,8 @@ RETRYABLE_EXCEPTIONS = (
     requests.Timeout,
     litellm.exceptions.Timeout,
     litellm.exceptions.APIConnectionError,
+    litellm.exceptions.APIError,
+    litellm.exceptions.RateLimitError
 )
 
 

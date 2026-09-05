@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import unicodedata
 from enum import Enum
 
 from graybox.capture import capture, capture_file
@@ -140,7 +141,19 @@ class Key(str, Enum):
     ENTER = "ENTER"
     ESC = "ESC"
     BACKSPACE = "BACKSPACE"
+    DELETE = "DELETE"
+    HOME = "HOME"
+    END = "END"
     CTRL_C = "CTRL_C"
+    EOF = "EOF"
+
+
+_BRACKETED_PASTE_START = "\x1b[200~"
+_BRACKETED_PASTE_END = "\x1b[201~"
+
+_POSIX_INPUT_BUFFER = bytearray()
+
+logger = logging.getLogger(__name__)
 
 
 def _clear_screen() -> None:
@@ -196,6 +209,12 @@ def _normalize_readchar_key(k: str) -> Key | str:
             return Key.ESC
         if k == getattr(readchar.key, "BACKSPACE", object()) or k in ("\b", "", "\b"):
             return Key.BACKSPACE
+        if k == getattr(readchar.key, "DELETE", object()):
+            return Key.DELETE
+        if k == getattr(readchar.key, "HOME", object()):
+            return Key.HOME
+        if k == getattr(readchar.key, "END", object()):
+            return Key.END
     return k
 
 
@@ -211,6 +230,57 @@ def _utf8_sequence_len(first_byte: int) -> int:
     return 1
 
 
+def _text_width(text: str) -> int:
+    """Return the terminal-column width of text for cursor repositioning."""
+    width = 0
+    for char in text:
+        if char in "\r\n" or unicodedata.category(char).startswith("M"):
+            continue
+        if unicodedata.category(char).startswith("C"):
+            continue
+        width += 2 if unicodedata.east_asian_width(char) in "WF" else 1
+    return width
+
+
+def _cursor_left(columns: int) -> str:
+    return f"\x1b[{columns}D" if columns else ""
+
+
+def _cursor_right(columns: int) -> str:
+    return f"\x1b[{columns}C" if columns else ""
+
+
+def _is_grapheme_extension(char: str) -> bool:
+    return unicodedata.category(char).startswith("M") or char == "\u200d"
+
+
+def _is_virama(char: str) -> bool:
+    return "VIRAMA" in unicodedata.name(char, "")
+
+
+def _previous_grapheme_start(buf: list[str], cursor: int) -> int:
+    start = cursor - 1
+    while start > 0 and _is_grapheme_extension(buf[start]):
+        start -= 1
+    # Indic conjuncts such as र् + य should move as one visible character.
+    while start > 0 and _is_virama(buf[start - 1]):
+        start -= 2
+    return max(start, 0)
+
+
+def _next_grapheme_end(buf: list[str], cursor: int) -> int:
+    if cursor >= len(buf):
+        return cursor
+    end = cursor + 1
+    while end < len(buf) and _is_grapheme_extension(buf[end]):
+        end += 1
+    while end < len(buf) and _is_virama(buf[end - 1]):
+        end += 1
+        while end < len(buf) and _is_grapheme_extension(buf[end]):
+            end += 1
+    return end
+
+
 def _decode_key(data: bytes) -> str:
     try:
         return data.decode("utf-8")
@@ -218,86 +288,318 @@ def _decode_key(data: bytes) -> str:
         return ""
 
 
-def _getch() -> Key | str:
+def _is_high_surrogate(ch: str) -> bool:
+    return len(ch) == 1 and 0xD800 <= ord(ch) <= 0xDBFF
+
+
+def _is_low_surrogate(ch: str) -> bool:
+    return len(ch) == 1 and 0xDC00 <= ord(ch) <= 0xDFFF
+
+
+def _combine_surrogate_pair(high: str, low: str) -> str:
+    """Recombine a UTF-16 surrogate pair into one Unicode code point.
+
+    Windows' getwch() delivers astral-plane characters (many emoji, some
+    CJK-extension characters) as two separate wide-char reads, each an
+    unpaired surrogate. An unpaired surrogate is not valid to write to a
+    UTF-8 stream (raises UnicodeEncodeError) and confuses width/category
+    lookups, so these must be recombined before being treated as "a
+    character" anywhere else in the input pipeline.
+    """
+    high_val = ord(high) - 0xD800
+    low_val = ord(low) - 0xDC00
+    return chr(0x10000 + (high_val << 10) + low_val)
+
+
+def _read_posix_byte(fd: int) -> bytes:
+    """Read one byte from fd, preferring anything already stashed from a
+    prior partial read. Returns b"" on EOF (never raises on a closed/EOF
+    stream - that is a normal, expected condition here, not an error)."""
+    if _POSIX_INPUT_BUFFER:
+        value = _POSIX_INPUT_BUFFER[0]
+        del _POSIX_INPUT_BUFFER[0]
+        return bytes((value,))
     try:
+        return os.read(fd, 1)
+    except OSError:
+        logger.debug("stdin read failed; treating as EOF", exc_info=True)
+        return b""
+
+
+def _read_bracketed_paste() -> str:
+    """Read a terminal paste between bracketed-paste delimiters.
+
+    Bracketed paste keeps newlines and UTF-8 text from being interpreted as
+    individual commands/keys.  This function is called after the start
+    delimiter has already been consumed by _getch().
+    """
+    if os.name == "nt":
         import msvcrt
 
-        ch = msvcrt.getch()
-        if ch in (b"\x00", b"\xe0"):
-            code = msvcrt.getch()
-            mapping = {b"H": Key.UP, b"P": Key.DOWN, b"K": Key.LEFT, b"M": Key.RIGHT}
-            return mapping.get(code, "")
-        if ch == b"\n":
-            return Key.ENTER
-        if ch == b"\x1b":
+        chars: list[str] = []
+        try:
+            while True:
+                ch = msvcrt.getwch()
+                if not ch:
+                    break  # stream gone mid-paste; return what we have
+                chars.append(ch)
+                text = "".join(chars)
+                if text.endswith(_BRACKETED_PASTE_END):
+                    return text[: -len(_BRACKETED_PASTE_END)]
+        except Exception:
+            logger.debug("Bracketed-paste read failed on Windows", exc_info=True)
+        return "".join(chars)
+
+    import termios
+    import tty
+
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    payload = bytearray()
+    try:
+        tty.setraw(fd, termios.TCSANOW)
+        while True:
+            try:
+                chunk = os.read(fd, 4096)
+            except OSError:
+                logger.debug("Bracketed-paste read failed", exc_info=True)
+                break
+            if not chunk:
+                break
+            payload.extend(chunk)
+            end = payload.find(_BRACKETED_PASTE_END.encode("ascii"))
+            if end < 0:
+                continue
+
+            marker_len = len(_BRACKETED_PASTE_END)
+            trailing = payload[end + marker_len :]
+            if trailing:
+                _POSIX_INPUT_BUFFER.extend(trailing)
+            payload = payload[:end]
+            break
+    finally:
+        try:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        except Exception:
+            logger.debug("Failed to restore terminal mode", exc_info=True)
+
+    return bytes(payload).decode("utf-8", "replace")
+
+
+def _set_bracketed_paste(enabled: bool) -> None:
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return
+    sys.stdout.write("\x1b[?2004h" if enabled else "\x1b[?2004l")
+    sys.stdout.flush()
+
+
+def _getch_windows(msvcrt) -> Key | str:
+    """Read one logical keypress on Windows. May raise on genuine,
+    unexpected backend failure; the caller (_getch) decides what "no
+    working keyboard" should mean - this function only knows how to read.
+    """
+
+    def _read_wide_char() -> str:
+        ch = msvcrt.getwch()
+        if _is_high_surrogate(ch) and msvcrt.kbhit():
+            nxt = msvcrt.getwch()
+            if _is_low_surrogate(nxt):
+                return _combine_surrogate_pair(ch, nxt)
+            return nxt
+        return ch
+
+    # getwch() returns complete Unicode characters, unlike getch(), which
+    # returns individual UTF-8 bytes for pasted input.
+    ch = _read_wide_char()
+    if not ch:
+        return Key.EOF
+    if ch in ("\x00", "\xe0"):
+        code = msvcrt.getwch()
+        mapping = {
+            "H": Key.UP,
+            "P": Key.DOWN,
+            "K": Key.LEFT,
+            "M": Key.RIGHT,
+            "G": Key.HOME,
+            "O": Key.END,
+            "S": Key.DELETE,
+        }
+        return mapping.get(code, "")
+    if ch in ("\n", "\r"):
+        return Key.ENTER
+    if ch == "\x1b":
+        known_sequences = {
+            "\x1b[A": Key.UP,
+            "\x1b[B": Key.DOWN,
+            "\x1b[C": Key.RIGHT,
+            "\x1b[D": Key.LEFT,
+            _BRACKETED_PASTE_START: _BRACKETED_PASTE_START,
+            _BRACKETED_PASTE_END: _BRACKETED_PASTE_END,
+        }
+        seq = ch
+        deadline = time.time() + 0.05
+        while any(candidate.startswith(seq) for candidate in known_sequences) and seq not in known_sequences:
+            while not msvcrt.kbhit():
+                if time.time() >= deadline:
+                    return Key.ESC if seq == ch else seq
+                time.sleep(0.002)
+            seq += msvcrt.getwch()
+        return known_sequences.get(seq, (Key.ESC if seq == ch else seq))
+    if ch == "\b":
+        return Key.BACKSPACE
+    if ch == "\x03":
+        return Key.CTRL_C
+    return ch
+
+
+def _getch_posix(select_mod, termios_mod, tty_mod) -> Key | str:
+    """Read one logical keypress on POSIX. May raise on genuine, unexpected
+    backend failure; the caller (_getch) decides what "no working keyboard"
+    should mean - this function only knows how to read.
+    """
+    fd = sys.stdin.fileno()
+    old = termios_mod.tcgetattr(fd)
+    try:
+        tty_mod.setraw(fd, termios_mod.TCSANOW)
+        ch = _read_posix_byte(fd)
+        if not ch:
+            return Key.EOF
+        if ch != b"\x1b":
+            if ch in (b"\n", b"\r"):
+                return Key.ENTER
+            if ch in (b"\b", b"\x7f"):
+                return Key.BACKSPACE
+            if ch == b"\x03":
+                return Key.CTRL_C
+            data = bytearray(ch)
+            expected = _utf8_sequence_len(ch[0])
+            # Stay in raw mode for the ENTIRE multi-byte reassembly. Returning
+            # out of this function on a short per-poll timeout would let the
+            # `finally` below restore canonical mode between polls - and a
+            # continuation byte that lands while the tty is briefly back in
+            # canonical/line-buffered mode gets trapped in the kernel's line
+            # discipline until a newline appears, corrupting or losing it
+            # (this was the root cause of the intermittent
+            # TestByteDelayedUtf8 failures under real keystroke latency).
+            # So poll internally, in a loop, and only give up after a real
+            # deadline - never by returning mid-character.
+            deadline = time.monotonic() + 1.0
+            while len(data) < expected:
+                if _POSIX_INPUT_BUFFER:
+                    more = _read_posix_byte(fd)
+                else:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return _decode_key(bytes(data))
+                    # Block for the whole remaining budget in one call rather
+                    # than re-polling in small slices - a tight poll loop
+                    # burns CPU and, under scheduler contention, can itself
+                    # add enough latency per iteration to make reassembly
+                    # slower than just waiting once.
+                    r, _, _ = select_mod.select([fd], [], [], remaining)
+                    if not r:
+                        return _decode_key(bytes(data))
+                    more = _read_posix_byte(fd)
+                if not more:
+                    return Key.EOF
+                data += more
+            return _decode_key(bytes(data))
+
+        seq = b"\x1b"
+        known_sequences = {
+            b"\x1b[A": Key.UP,
+            b"\x1b[B": Key.DOWN,
+            b"\x1b[C": Key.RIGHT,
+            b"\x1b[D": Key.LEFT,
+            b"\x1b[H": Key.HOME,
+            b"\x1b[F": Key.END,
+            b"\x1b[3~": Key.DELETE,
+            _BRACKETED_PASTE_START.encode("ascii"): _BRACKETED_PASTE_START,
+            _BRACKETED_PASTE_END.encode("ascii"): _BRACKETED_PASTE_END,
+        }
+        while True:
+            r, _, _ = select_mod.select([fd], [], [], 0.01)
+            if not r:
+                break
+            more = _read_posix_byte(fd)
+            if not more:
+                return Key.EOF
+            seq += more
+            if seq in known_sequences:
+                return known_sequences[seq]
+            if (
+                len(seq) > 2
+                and seq.startswith(b"\x1b[")
+                and 0x40 <= seq[-1] <= 0x7E
+                and seq[-1] not in b"0123456789;"
+            ):
+                break
+
+        if seq == b"\x1b":
             return Key.ESC
-        if ch in (b"\b",):
-            return Key.BACKSPACE
-        data = bytearray(ch)
-        expected = _utf8_sequence_len(ch[0])
-        while len(data) < expected and msvcrt.kbhit():
-            data += msvcrt.getch()
-        return _decode_key(bytes(data))
+        decoded = seq.decode("utf-8", "ignore")
+        if decoded == "\x1b[A":
+            return Key.UP
+        if decoded == "\x1b[B":
+            return Key.DOWN
+        if decoded == "\x1b[C":
+            return Key.RIGHT
+        if decoded == "\x1b[D":
+            return Key.LEFT
+        if decoded == "\x1b[H":
+            return Key.HOME
+        if decoded == "\x1b[F":
+            return Key.END
+        if decoded == "\x1b[3~":
+            return Key.DELETE
+        return decoded
+    finally:
+        try:
+            termios_mod.tcsetattr(fd, termios_mod.TCSADRAIN, old)
+        except Exception:
+            logger.debug("Failed to restore terminal mode", exc_info=True)
+
+
+def _getch() -> Key | str:
+    """Read one logical keypress. Guaranteed to never raise: any backend
+    failure is logged at debug level and treated as Key.EOF rather than
+    propagating and taking down the whole capture/input flow. EOF (a
+    genuinely closed/broken input stream) is a normal outcome here, not an
+    exceptional one - callers treat it like a cancel (see _interactive_input).
+    """
+    try:
+        import msvcrt
     except ImportError:
-        pass
+        msvcrt = None
+
+    if msvcrt is not None:
+        try:
+            return _getch_windows(msvcrt)
+        except Exception:
+            logger.debug("Windows key read failed", exc_info=True)
+            return Key.EOF
 
     try:
         import select
         import termios
         import tty
-
-        fd = sys.stdin.fileno()
-        old = termios.tcgetattr(fd)
-        try:
-            tty.setraw(fd, termios.TCSANOW)
-            ch = os.read(fd, 1)
-            if ch != b"\x1b":
-                if ch in (b"\n", b"\r"):
-                    return Key.ENTER
-                if ch in (b"\b", b"\x7f"):
-                    return Key.BACKSPACE
-                data = bytearray(ch)
-                expected = _utf8_sequence_len(ch[0])
-                while len(data) < expected:
-                    r, _, _ = select.select([fd], [], [], 0.01)
-                    if not r:
-                        break
-                    more = os.read(fd, 1)
-                    if not more:
-                        break
-                    data += more
-                return _decode_key(bytes(data))
-
-            seq = b"\x1b"
-            while True:
-                r, _, _ = select.select([fd], [], [], 0.01)
-                if not r:
-                    break
-                seq += os.read(fd, 1)
-
-            if seq == b"\x1b":
-                return Key.ESC
-            decoded = seq.decode("utf-8", "ignore")
-            if decoded == "\x1b[A":
-                return Key.UP
-            if decoded == "\x1b[B":
-                return Key.DOWN
-            if decoded == "\x1b[C":
-                return Key.RIGHT
-            if decoded == "\x1b[D":
-                return Key.LEFT
-            return decoded
-        finally:
-            termios.tcsetattr(fd, termios.TCSADRAIN, old)
     except ImportError:
-        pass
+        select = termios = tty = None
+
+    if termios is not None:
+        try:
+            return _getch_posix(select, termios, tty)
+        except Exception:
+            logger.debug("POSIX key read failed", exc_info=True)
+            return Key.EOF
 
     if readchar is not None:
         try:
             return _normalize_readchar_key(readchar.readkey())
         except Exception:
-            pass
-    return ""
+            logger.debug("readchar fallback failed", exc_info=True)
+
+    return Key.EOF
 
 
 class MockArgs:
@@ -323,29 +625,121 @@ def _render_home_banner(cfg) -> None:
     print(f"{ColorCodes.GREY}╰─────────────────────────────────────────────────────╯{ColorCodes.RESET}\n")
 
 
+def _line_mode_input(prompt: str) -> str | None:
+    """Fallback for when stdin/stdout isn't a real terminal (piped input,
+    redirected from a file, non-interactive CI, etc). The raw-mode path
+    below needs a real tty - calling termios.tcgetattr on a non-tty fd
+    raises - so route those cases here instead of crashing."""
+    print(prompt, end="", flush=True)
+    try:
+        line = sys.stdin.readline()
+    except Exception:
+        logger.debug("Line-mode input failed", exc_info=True)
+        return None
+    if line == "":  # true EOF, as opposed to an empty line ("\n")
+        print()
+        return None
+    return line.rstrip("\n").rstrip("\r")
+
+
 def _interactive_input(prompt: str) -> str | None:
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return _line_mode_input(prompt)
+
     print(prompt, end="", flush=True)
     buf: list[str] = []
-    while True:
-        ch = _getch()
-        if ch == Key.ESC:
-            print()
-            return None
-        if ch == Key.ENTER:
-            print()
-            return "".join(buf)
-        if ch == Key.BACKSPACE:
-            if buf:
-                buf.pop()
-                sys.stdout.write("\b \b")
-                sys.stdout.flush()
-            continue
-        if ch == Key.CTRL_C:
-            raise KeyboardInterrupt
-        if isinstance(ch, str) and len(ch) == 1 and ch.isprintable():
-            buf.append(ch)
-            sys.stdout.write(ch)
-            sys.stdout.flush()
+    cursor = 0
+
+    def insert_text(text: str) -> None:
+        nonlocal cursor
+        chars = list(text)
+        tail = "".join(buf[cursor:])
+        buf[cursor:cursor] = chars
+        cursor += len(chars)
+        sys.stdout.write(text + tail + "\x1b[K" + _cursor_left(_text_width(tail)))
+        sys.stdout.flush()
+
+    def redraw_after_change(tail: str) -> None:
+        sys.stdout.write(tail + "\x1b[K" + _cursor_left(_text_width(tail)))
+        sys.stdout.flush()
+
+    _set_bracketed_paste(True)
+    try:
+        while True:
+            ch = _getch()
+            if ch in (Key.ESC, Key.EOF):
+                print()
+                return None
+            if ch == Key.CTRL_C:
+                raise KeyboardInterrupt
+            try:
+                if ch == Key.ENTER:
+                    print()
+                    return "".join(buf)
+                if ch == Key.BACKSPACE:
+                    if cursor:
+                        start = _previous_grapheme_start(buf, cursor)
+                        deleted = "".join(buf[start:cursor])
+                        del buf[start:cursor]
+                        cursor = start
+                        tail = "".join(buf[cursor:])
+                        sys.stdout.write(_cursor_left(_text_width(deleted)))
+                        redraw_after_change(tail)
+                    continue
+                if ch == Key.DELETE:
+                    if cursor < len(buf):
+                        end = _next_grapheme_end(buf, cursor)
+                        del buf[cursor:end]
+                        redraw_after_change("".join(buf[cursor:]))
+                    continue
+                if ch == Key.LEFT:
+                    if cursor:
+                        start = _previous_grapheme_start(buf, cursor)
+                        cursor_text = "".join(buf[start:cursor])
+                        cursor = start
+                        sys.stdout.write(_cursor_left(_text_width(cursor_text)))
+                        sys.stdout.flush()
+                    continue
+                if ch == Key.RIGHT:
+                    if cursor < len(buf):
+                        end = _next_grapheme_end(buf, cursor)
+                        sys.stdout.write(_cursor_right(_text_width("".join(buf[cursor:end]))))
+                        cursor = end
+                        sys.stdout.flush()
+                    continue
+                if ch == Key.HOME:
+                    sys.stdout.write(_cursor_left(_text_width("".join(buf[:cursor]))))
+                    cursor = 0
+                    sys.stdout.flush()
+                    continue
+                if ch == Key.END:
+                    sys.stdout.write(_cursor_right(_text_width("".join(buf[cursor:]))))
+                    cursor = len(buf)
+                    sys.stdout.flush()
+                    continue
+                if ch == _BRACKETED_PASTE_START:
+                    pasted = _read_bracketed_paste()
+                    insert_text(pasted)
+                    continue
+                if (
+                    isinstance(ch, str)
+                    and len(ch) == 1
+                    and (ch.isprintable() or unicodedata.category(ch).startswith("M"))
+                ):
+                    insert_text(ch)
+            except Exception:
+                logger.debug("Error handling keystroke %r", ch, exc_info=True)
+                continue
+    except OSError:
+        # Broken pipe / display gone mid-session: preserve whatever was
+        # typed instead of raising out of a capture flow.
+        logger.debug("I/O error during interactive input", exc_info=True)
+        return "".join(buf) if buf else None
+    finally:
+        try:
+            _set_bracketed_paste(False)
+        except Exception:
+            logger.debug("Failed to disable bracketed paste", exc_info=True)
 
 
 def _pick_workspace(cfg, prompt: str = "Select workspace") -> Workspace | None:
@@ -446,11 +840,6 @@ def cmd_ask(args):
     if answer.sources:
         print(f"{ColorCodes.DIM}Sources: {', '.join(answer.sources)}{ColorCodes.RESET}")
     if answer.fallback:
-        # The situational warning (raw captures vs. weak wiki match vs.
-        # weak inbox match) is already baked into answer.text by
-        # retrieval.py - only the actionable follow-up tip goes here, kept
-        # accurate per fallback_kind instead of one message assumed to
-        # always mean "came from raw captures."
         print(f"{ColorCodes.YELLOW}   {_fallback_tip(answer.fallback_kind)}{ColorCodes.RESET}")
 
 def cmd_chat(args):

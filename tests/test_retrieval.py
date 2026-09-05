@@ -1,10 +1,10 @@
-"""Tests for retrieval.py — hybrid keyword + semantic search."""
+"""Tests for retrieval.py"""
 from __future__ import annotations
 
 from unittest.mock import MagicMock
 import pytest
 
-from graybox.retrieval import ask, _blend_hits, _render_note, _build_context
+from graybox.retrieval import ask, _blend_hits, _render_note, _build_context, _expand_graph
 from graybox.search_engine import Hit, _PageDoc, _InboxDoc
 from graybox.models import Page, now_iso
 from graybox.storage import write_page, write_inbox_item
@@ -430,3 +430,83 @@ class TestWeakInboxLastResort:
         assert answer.fallback_kind == ""
         assert answer.text.startswith("I don't have enough information")
         assert llm.llm_call.call_count == 0
+
+class TestExpandGraphScoring:
+    """BUG: `_expand_graph` scored every neighbor purely by graph distance
+    (`parent_score * decay ** hop`), with zero regard for whether the
+    neighbor's own content is actually relevant to the query - and the
+    first parent to reach a shared neighbor in the BFS locked in its score
+    forever, even when a later, stronger parent could have scored it
+    higher. Both are fixed by (1) blending in `Engine.coverage_scorer`
+    against the original search query, and (2) always keeping the max
+    score seen for a node across all incoming paths rather than
+    first-write-wins.
+    """
+
+    def test_relevant_but_distant_neighbor_is_not_suppressed_by_pure_decay(self, temp_cfg):
+        """A neighbor two hops of decay away, but whose own content is a
+        strong lexical match for the query, must not be scored as if it
+        were irrelevant just because it's graph-distant from the anchor."""
+        anchor = Page(
+            id="anchor", type="topic", title="Anchor",
+            created=now_iso(), updated=now_iso(), summary="Unrelated filler content.",
+            related=["topic/relevant-neighbor"],
+        )
+        neighbor = Page(
+            id="relevant-neighbor", type="topic", title="Relevant Neighbor",
+            created=now_iso(), updated=now_iso(),
+            summary="Quantum entanglement quantum entanglement quantum entanglement.",
+        )
+        write_page(temp_cfg, anchor)
+        write_page(temp_cfg, neighbor)
+
+        anchor_hit = Hit(doc=_PageDoc(anchor), score=0.42)  # just above min_score
+
+        results = _expand_graph(
+            temp_cfg, [anchor_hit], "quantum entanglement",
+            max_hops=1, decay=0.65, graph_min_score=0.35,
+        )
+
+        by_ref = {h.doc.search_id: h for h in results}
+        assert "topic/relevant-neighbor" in by_ref
+        # Pure decay would give ~0.42 * 0.65 = 0.273 (below graph_min_score
+        # entirely). Content relevance must be able to rescue/boost this.
+        pure_decay_score = round(0.42 * 0.65, 4)
+        assert by_ref["topic/relevant-neighbor"].score > pure_decay_score
+
+    def test_shared_neighbor_gets_max_score_regardless_of_visit_order(self, temp_cfg):
+        """C is reachable from both a weak hit B and a strong hit A. C's
+        final score must reflect the BEST path (via A), not whichever of
+        A/B happened to be popped from the BFS frontier first."""
+        shared = Page(
+            id="shared", type="topic", title="Shared",
+            created=now_iso(), updated=now_iso(), summary="Filler.",
+        )
+        weak_parent = Page(
+            id="weak-parent", type="topic", title="Weak Parent",
+            created=now_iso(), updated=now_iso(), summary="Filler.",
+            related=["topic/shared"],
+        )
+        strong_parent = Page(
+            id="strong-parent", type="topic", title="Strong Parent",
+            created=now_iso(), updated=now_iso(), summary="Filler.",
+            related=["topic/shared"],
+        )
+        write_page(temp_cfg, shared)
+        write_page(temp_cfg, weak_parent)
+        write_page(temp_cfg, strong_parent)
+
+        weak_hit = Hit(doc=_PageDoc(weak_parent), score=0.40)
+        strong_hit = Hit(doc=_PageDoc(strong_parent), score=0.95)
+
+        # Weak hit ordered FIRST in the frontier - under the old
+        # first-write-wins logic this alone would lock in the low score.
+        results = _expand_graph(
+            temp_cfg, [weak_hit, strong_hit], "irrelevant nonsense query xyz",
+            max_hops=1, decay=0.65, graph_min_score=0.1,
+        )
+
+        by_ref = {h.doc.search_id: h for h in results}
+        assert "topic/shared" in by_ref
+        expected_best = round(0.95 * 0.65, 4)
+        assert by_ref["topic/shared"].score == pytest.approx(expected_best)
