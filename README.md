@@ -254,7 +254,7 @@ Graybox searches for configuration in this order:
 4. `.graybox/config.yaml`
 5. `~/.graybox/config.yaml`
 
-The first existing file wins; these files are not merged together. Paths in steps 3–4 are relative to the current terminal directory. The home-directory fallback is automatic; there is no `GRAYBOX_USE_GLOBAL_CONFIG` setting. To select a file explicitly:
+The first existing file wins; these files are not merged together. Paths in steps 3–4 are relative to the current terminal directory. The home-directory fallback is automatic. To select a file explicitly:
 
 ```bash
 graybox --config /path/to/config.yaml status
@@ -522,7 +522,7 @@ All of `curate.py` is deterministic Python with no LLM involvement, precisely so
 <summary><strong>Is my data private? Does anything leave my machine?</strong></summary>
 <br>
 
-Your inbox, wiki, and state are stored locally. LLM and embedding operations send note content, retrieved context, or chat history to the provider configured through LiteLLM. Use local endpoints for both completion and embeddings (or disable embeddings) to keep those model requests on your machine. The optional MCP server also returns requested memory content to its connected client.
+Your inbox, wiki, and state are stored locally. LLM and embedding operations send note content, retrieved context, or chat history to the provider configured through LiteLLM. Use local endpoints for both completion and embeddings (or disable embeddings) to keep those model requests on your machine.
 
 </details>
 
