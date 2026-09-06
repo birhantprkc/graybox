@@ -23,7 +23,7 @@ from graybox.prompts import (
     HISTORY_COMPRESSION_PROMPT,
 )
 from graybox.search import search_all
-from graybox.search_engine import Hit, _PageDoc
+from graybox.search_engine import Engine, Hit, Query, _PageDoc
 from graybox.workspace import workspace_context_block
 from graybox.embedding_index import search_embeddings
 from graybox.adaptive_compressor import compress_context
@@ -390,6 +390,7 @@ def _blend_hits(keyword_hits: list[Hit], semantic_refs: list[tuple[str, float]],
 def _expand_graph(
     cfg,
     hits,
+    query: Query | str,
     *,
     max_hops: int = 1,
     max_nodes: int = 25,
@@ -397,23 +398,47 @@ def _expand_graph(
     decay: float = 0.65,
     graph_min_score: float = 0.35,
 ):
+    """1-or-more-hop expansion through `related`/`backlinks`.
+
+    Each neighbor's score is the MAX of two signals, not graph distance
+    alone:
+      - proximity: parent_score * decay ** hop (the original signal)
+      - relevance: Engine.coverage_scorer(query, neighbor) - the same
+        cheap, in-memory keyword scorer used everywhere else in the app,
+        run against the ORIGINAL search query. This is a few regex-token
+        set operations per neighbor, not an LLM/embedding call, so it adds
+        negligible latency next to the completion call that follows.
+    This keeps a link-adjacent-but-off-topic page from riding hop-decay
+    alone, while a page that's genuinely about the query still surfaces
+    even if it's graph-distant from the strongest anchor hit.
+
+    A node reachable from multiple parents always keeps the BEST score
+    seen across all of them (max-wins), never whichever parent happened
+    to be popped from the BFS frontier first. Each node is still expanded
+    (fanned out from) at most once, to keep this bounded and cycle-safe.
+    """
     from graybox.storage import read_page
 
     wiki_hits = [h for h in hits if h.doc.source_kind == "wiki"]
     if not wiki_hits:
         return hits
 
+    if isinstance(query, str):
+        query = Query.parse(query)
+
     # Keep the best hit per ref as the starting frontier.
     best_by_ref: dict[str, Hit] = {h.doc.search_id: h for h in wiki_hits}
     frontier = deque((h.doc.search_id, 0, h.score) for h in wiki_hits)
 
-    seen: set[str] = set(best_by_ref.keys())
-    expanded: list[Hit] = []
+    expanded_from: set[str] = set()   # nodes we've already fanned out from
+    queued: set[str] = set(best_by_ref.keys())  # refs currently pending in frontier
 
-    while frontier and len(seen) < max_nodes:
+    while frontier and len(best_by_ref) < max_nodes:
         ref, hop, parent_score = frontier.popleft()
-        if hop >= max_hops:
+        queued.discard(ref)
+        if hop >= max_hops or ref in expanded_from:
             continue
+        expanded_from.add(ref)
 
         page_type, slug = ref.split("/", 1)
         page = read_page(cfg, page_type, slug)
@@ -425,7 +450,7 @@ def _expand_graph(
         neighbors = neighbors[:max_neighbors_per_node]
 
         for n_ref in neighbors:
-            if n_ref in seen or len(seen) >= max_nodes:
+            if n_ref not in best_by_ref and len(best_by_ref) >= max_nodes:
                 continue
 
             n_type, n_slug = n_ref.split("/", 1)
@@ -433,23 +458,29 @@ def _expand_graph(
             if not n_page:
                 continue
 
-            new_score = round(parent_score * (decay ** (hop + 1)), 4)
-            if new_score < graph_min_score:
+            proximity_score = round(parent_score * (decay ** (hop + 1)), 4)
+            relevance_score = Engine.coverage_scorer(query, _PageDoc(n_page))
+            new_score = max(proximity_score, relevance_score)
+
+            existing = best_by_ref.get(n_ref)
+            if existing is None and new_score < graph_min_score:
                 continue
 
-            hit = Hit(
-                doc=_PageDoc(n_page),
-                score=new_score,
-                linked_from=getattr(page, "title", ref),
-            )
-            expanded.append(hit)
-            best_by_ref[n_ref] = hit
-            seen.add(n_ref)
+            if existing is None or new_score > existing.score:
+                best_by_ref[n_ref] = Hit(
+                    doc=_PageDoc(n_page),
+                    score=new_score,
+                    linked_from=getattr(page, "title", ref),
+                )
 
-            # Only expand the promising neighbors.
-            frontier.append((n_ref, hop + 1, new_score))
+            # Only queue for further expansion once - re-scoring an
+            # already-expanded or already-queued node doesn't need a
+            # second visit, just the score update above.
+            if n_ref not in expanded_from and n_ref not in queued:
+                frontier.append((n_ref, hop + 1, best_by_ref[n_ref].score))
+                queued.add(n_ref)
 
-    out = list(best_by_ref.values()) + expanded
+    out = list(best_by_ref.values())
     out.sort(key=lambda h: h.score, reverse=True)
     return out
 
@@ -530,8 +561,8 @@ def ask(cfg, llm, question, all_workspaces=False, history=None) -> Answer:
     strong_wiki = [h for h in wiki_hits if h.score >= cfg.retrieval.min_score]
     if strong_wiki and not all_workspaces:
         expanded = _expand_graph(
-            cfg, strong_wiki,
-            max_hops=getattr(cfg.retrieval, "graph_max_hops", 1),
+            cfg, strong_wiki, search_query,
+            max_hops=getattr(cfg.retrieval, "graph_max_hops", 2),
             max_nodes=getattr(cfg.retrieval, "graph_max_nodes", cfg.retrieval.top_k * 3),
             max_neighbors_per_node=getattr(cfg.retrieval, "graph_max_neighbors_per_node", 5),
             decay=getattr(cfg.retrieval, "graph_decay", 0.65),

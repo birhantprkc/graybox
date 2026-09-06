@@ -1,0 +1,70 @@
+# Gray Box
+
+> A local-first personal knowledge system: capture free-form notes, organize them into a linked Markdown wiki on demand, and ask questions with source citations.
+
+Gray Box requires Python 3.10+. The `graybox` CLI launches a Textual home menu when run without arguments in an interactive terminal. Storage is plain Markdown with YAML frontmatter plus JSON/JSONL state; no database or vector database is required. LiteLLM handles model calls, while Python handles filesystem writes. Capture does not call a model. Organization, retrieval, summary refresh, and Obsidian migration can call the configured provider.
+
+## Core documentation
+
+- [README](https://github.com/Aaryanverma/graybox/blob/main/README.md): installation, quick start, commands, configuration, workspaces, history, migration, MCP integration, and FAQ.
+- [Example configuration](https://github.com/Aaryanverma/graybox/blob/main/graybox/config.example.yaml): annotated setup using Ollama; its chosen values differ from some built-in defaults.
+- [Configuration implementation](https://github.com/Aaryanverma/graybox/blob/main/graybox/config.py): authoritative defaults, dataclasses, environment mappings, and file discovery.
+- [Packaging](https://github.com/Aaryanverma/graybox/blob/main/pyproject.toml): console entry point, Python requirement, and optional `test`/`azure` dependencies.
+- [Runtime dependencies](https://github.com/Aaryanverma/graybox/blob/main/requirements.txt): dependencies including LiteLLM, PyYAML, requests, tenacity, python-dotenv, readchar, and Textual; some versions are pinned.
+
+## Operational behavior
+
+- Core loop: `graybox capture "<text>"`, `graybox organize`, `graybox ask "<question>"`, or `graybox chat`. Organization is on demand, not a background worker.
+- `capture` reads stdin when text is omitted. `--file <path>` imports UTF-8 text with a source-path header; binary document ingestion is unsupported. Python callers can attach an `extra` dictionary, which organization propagates to pages.
+- Page types: `project`, `person`, `meeting`, `technology`, `company`, `topic`, `task`, `decision`, `action`, `event`, `journal`. References use singular types (`person/alice`); files follow `TYPE_DIR` (`wiki/people/alice.md`).
+- `ask`/`chat` combine keyword search and optional semantic search. Strong wiki matches seed a bounded graph walk over `related`/`backlinks`: configured defaults are one hop, 15 nodes, five neighbors per node, decay 0.65, and a score floor of `min_score * 0.5`. Neighbor scores take the stronger of query relevance and decayed proximity; repeated references retain their best score.
+- Retrieval tries strong wiki evidence first, then inbox evidence if synthesis is empty or a recognized refusal. When there are no strong wiki matches, weaker wiki evidence can be tried; weak inbox hits are a final fallback. Fallback answers carry warnings. If every available tier fails, the result is `NO_EVIDENCE_MSG` with no sources. Grounding and citations are prompt requirements, not a guarantee against hallucination.
+- Chat uses conversation history to rewrite follow-up search queries and resolve references. History is not authoritative evidence. Oversized context/history may trigger compression calls; answers and fallback attempts can require additional completions.
+- `search` is keyword-only, with no completion or embedding call. It shows wiki hits first, or raw inbox hits when no wiki hits exist. `--top-k` defaults to 10. `ask`, `chat`, and `search` accept `--all` for workspace-qualified results; graph expansion is skipped across workspaces.
+- `organize` automatically refreshes summaries on touched pages with at least three notes unless `auto_refresh_summaries: false`. `refresh-summaries` also runs manually. Dry-run organization, migration, and summary refresh can call the LLM without applying page changes; configuration loading can initialize workspace metadata.
+- `forget` tombstones a capture, excluding it from normal inbox reads and future organization. Existing wiki pages remain. `--purge` deletes the raw file; `--scrub` removes matching source-tagged notes and source references from current pages. It does not regenerate summaries or erase embeddings/history.
+- Wiki writes record best-effort Markdown snapshots in `.state/history/<shard>/<type>--<slug>.jsonl`. History and diffs are Python APIs; `restore()`/`undo()` return text without writing it back. There are no history/undo CLI commands.
+- Embeddings are opt-in, stored in `.state/embeddings.json` with content hashes and searched by linear cosine-similarity scan. `rebuild-index` backfills existing pages and accepts `--type`.
+
+## Configuration and workspaces
+
+- Value precedence: environment overrides > selected YAML > defaults. A configured `env_file` is resolved relative to the YAML file and loaded with `override=True`, replacing matching shell values before overrides are applied.
+- File discovery selects the first existing path: explicit `--config`, `GRAYBOX_CONFIG`, `./config.yaml`, `./.graybox/config.yaml`, then `~/.graybox/config.yaml`. The home fallback is automatic. Put `--config` before the subcommand, for example `graybox --config /path/to/config.yaml status`.
+- The app root defaults to `.graybox` under the current working directory; the initial workspace is `personal`. Workspaces have isolated inbox/wiki/state and can use custom paths. `workspace-list`, `workspace-switch [name]`, and `workspace-create [name] --description "..." --path <path>` manage them.
+- Built-in retrieval defaults: `top_k: 5`, `min_score: 0.4`, `dedup_threshold: 0.85`, `semantic_min_score: 0.15`, `inbox_min_score: null`. The example YAML chooses `min_score: 0.8`. A null inbox threshold derives from `min_score * 0.5`. `semantic_min_score` is a raw cosine calibration anchor and must remain below 0.5.
+- `prompts.answer_style` or `GRAYBOX_ANSWER_STYLE_PROMPT` controls answer presentation while retaining grounding, citation, uncertainty, and refusal instructions.
+- `GRAYBOX_ROOT` and legacy `GRAYBOX_WORKSPACE` select the app root; `GRAYBOX_ACTIVE_WORKSPACE` selects the workspace. Model credentials use `GRAYBOX_LLM_API_KEY` and `GRAYBOX_EMBEDDINGS_API_KEY` (plural `EMBEDDINGS`). See `config.py` for the full mapping.
+- Use YAML booleans for `embeddings.enabled`. The current `GRAYBOX_EMBEDDINGS_ENABLED` override is not parsed as a boolean, so even the string `false` is truthy.
+- Model calls send content to the configured completion/embedding providers. Local storage alone does not imply local inference. Concurrent writers to the same workspace are unsupported.
+
+## Capture, organization, and curation
+
+- [capture.py](https://github.com/Aaryanverma/graybox/blob/main/graybox/capture.py): raw-text capture and UTF-8 file import without LLM calls.
+- [organizer.py](https://github.com/Aaryanverma/graybox/blob/main/graybox/organizer.py): JSON extraction, entity reconciliation, deterministic page merging/linking, metadata propagation, and automatic summary refresh.
+- [curate.py](https://github.com/Aaryanverma/graybox/blob/main/graybox/curate.py): deterministic `merge`, `edit`, and `delete`, with reference rewiring and dry-run support. Explicit merge uses supplied refs, not a similarity threshold.
+- [forget.py](https://github.com/Aaryanverma/graybox/blob/main/graybox/forget.py): capture tombstones, optional raw-file purge, and source-note scrubbing.
+- [summarizer.py](https://github.com/Aaryanverma/graybox/blob/main/graybox/summarizer.py): summary synthesis from accumulated page notes.
+- [migrate_obsidian.py](https://github.com/Aaryanverma/graybox/blob/main/graybox/migrate_obsidian.py): one-time `migrate-vault` import, classification, provenance, and link rewriting; not synchronization. Rebuild embeddings after import when enabled.
+
+## Storage and retrieval
+
+- [models.py](https://github.com/Aaryanverma/graybox/blob/main/graybox/models.py): page/inbox/migration dataclasses, optional metadata, page types, and directory mapping.
+- [storage.py](https://github.com/Aaryanverma/graybox/blob/main/graybox/storage.py): Markdown/frontmatter I/O, processed and forgotten state, and reference rewiring.
+- [index.py](https://github.com/Aaryanverma/graybox/blob/main/graybox/index.py): per-workspace in-memory cache with filesystem change detection.
+- [search_engine.py](https://github.com/Aaryanverma/graybox/blob/main/graybox/search_engine.py): normalized keyword relevance (`coverage_scorer`) and entity-name similarity (`name_scorer`).
+- [search.py](https://github.com/Aaryanverma/graybox/blob/main/graybox/search.py): wiki/inbox keyword search, cross-workspace search, and duplicate suggestions.
+- [retrieval.py](https://github.com/Aaryanverma/graybox/blob/main/graybox/retrieval.py): semantic enrichment, bounded graph expansion, follow-up rewriting, context construction, and cited-answer/fallback paths.
+- [embedding_index.py](https://github.com/Aaryanverma/graybox/blob/main/graybox/embedding_index.py): JSON embedding cache, content hashing, cosine scoring, and calibration.
+- [history_tracker.py](https://github.com/Aaryanverma/graybox/blob/main/graybox/history_tracker.py): JSONL snapshots, deletion tombstones, history, diffs, and snapshot-text retrieval.
+- [workspace.py](https://github.com/Aaryanverma/graybox/blob/main/graybox/workspace.py): workspace registry, metadata, custom paths, and active-workspace persistence.
+
+## LLM layer and interfaces
+
+- [ai_service.py](https://github.com/Aaryanverma/graybox/blob/main/graybox/ai/ai_service.py): LiteLLM completions, streaming/batch APIs, embeddings, and retry/backoff. CLI ask/chat currently use blocking synthesis.
+- [auth.py](https://github.com/Aaryanverma/graybox/blob/main/graybox/ai/auth.py): API-key and Azure/Entra authentication handling.
+- [adaptive_compressor.py](https://github.com/Aaryanverma/graybox/blob/main/graybox/adaptive_compressor.py): best-effort LLM compression using a model-window budget; returns original text when compression fails.
+- [prompts.py](https://github.com/Aaryanverma/graybox/blob/main/graybox/prompts.py): extraction, retrieval, summary, query-rewriting, compression, and migration prompts.
+- [cli.py](https://github.com/Aaryanverma/graybox/blob/main/graybox/cli.py): authoritative command parser and handlers, including `status`, `pages`, `dupes`, `dashboard`, `refresh-summaries`, `rebuild-index`, `migrate-vault`, and workspace commands. Interactive input supports Unicode editing and bracketed paste.
+- [tui_home.py](https://github.com/Aaryanverma/graybox/blob/main/graybox/tui_home.py): Textual home menu; search, pages, and dupes are under More Options.
+- [dashboard.py](https://github.com/Aaryanverma/graybox/blob/main/graybox/dashboard.py): self-contained HTML dashboard exported to `<workspace>/exports/dashboard.html`; does not write back to inbox/wiki.
+- [Tests](https://github.com/Aaryanverma/graybox/tree/main/tests): install with `pip install -e '.[test]'`, then run `python -m pytest tests` from the repository root.

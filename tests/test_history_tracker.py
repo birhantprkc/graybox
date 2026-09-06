@@ -1,9 +1,9 @@
 """Tests for the pure-Python history tracker (git-like, no external git)."""
 from __future__ import annotations
 
-from graybox.history_tracker import HistoryTracker, _history_tracker, _maybe_record, _maybe_record_deletion
+from graybox.history_tracker import _history_tracker
 from graybox.models import Page, now_iso
-from graybox.storage import read_page, write_page
+from graybox.storage import write_page
 
 
 class TestHistoryTracker:

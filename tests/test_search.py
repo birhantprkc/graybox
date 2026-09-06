@@ -1,7 +1,7 @@
 """Tests for search.py — search_all() and find_duplicates()."""
 from __future__ import annotations
 
-from graybox.models import Page, InboxItem, now_iso
+from graybox.models import Page, now_iso
 from graybox.search import search_all, find_duplicates
 from graybox.storage import write_page, write_inbox_item
 

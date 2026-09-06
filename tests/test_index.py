@@ -1,19 +1,11 @@
 """Tests for index.py — mtime-based caching eliminates full-corpus scans."""
 from __future__ import annotations
 
-import time
-
 from graybox.index import (
-    cached_list_pages,
-    cached_list_inbox_items,
-    cached_read_page,
-    invalidate_page,
-    invalidate_inbox,
     invalidate_all,
     _page_cache,
-    _inbox_cache,
 )
-from graybox.models import Page, InboxItem, now_iso
+from graybox.models import Page, now_iso
 from graybox.storage import write_page, write_inbox_item, read_page, list_pages, list_inbox_items
 
 
